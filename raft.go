@@ -124,9 +124,11 @@ func (rc *raftNode) saveSnap(snap raftpb.Snapshot) error {
 	// save the snapshot file before writing the snapshot to the wal.
 	// This makes it possible for the snapshot file to become orphaned, but prevents
 	// a WAL snapshot entry from having no corresponding snapshot file.
+	// 将真正的 snapshot 保存到磁盘上
 	if err := rc.snapshotter.SaveSnap(snap); err != nil {
 		return err
 	}
+	// 添加一条 snapshot wal record
 	if err := rc.wal.SaveSnapshot(walSnap); err != nil {
 		return err
 	}
@@ -206,6 +208,11 @@ func (rc *raftNode) loadSnapshot() *raftpb.Snapshot {
 		if err != nil {
 			log.Fatalf("raftexample: error listing snapshots (%v)", err)
 		}
+		// wal 中记录了 snapshot record, 这里加载最近的 snapshot
+		// snapshotter 是一个目录，里面保存了很多snapshot, 通过 wal record 可以找到 newest
+		// 然后从磁盘上读到那个(snapshot的序列化是由 Snapshotter 实现的，配合 wal)
+		// 这些是 etcd server 实现的，如果不想复用，这部分逻辑可以自行实现
+		// 这里返回的 snapshot 就是包含上层的状态机 snapshot
 		snapshot, err := rc.snapshotter.LoadNewestAvailable(walSnaps)
 		if err != nil && err != snap.ErrNoSnapshot {
 			log.Fatalf("raftexample: error loading snapshot (%v)", err)
@@ -245,19 +252,27 @@ func (rc *raftNode) openWAL(snapshot *raftpb.Snapshot) *wal.WAL {
 // replayWAL replays WAL entries into the raft instance.
 func (rc *raftNode) replayWAL() *wal.WAL {
 	log.Printf("replaying WAL of member %d", rc.id)
+	// 内部会更新 rc.snapshotter
 	snapshot := rc.loadSnapshot()
+	// 只需要 Index 和 Term 就能知道 wal 应该从哪个位置开始
 	w := rc.openWAL(snapshot)
+	// read 的 ents 都是大于 index 的
 	_, st, ents, err := w.ReadAll()
 	if err != nil {
 		log.Fatalf("raftexample: failed to read WAL (%v)", err)
 	}
 	rc.raftStorage = raft.NewMemoryStorage()
+
+	// 设置 raftStorage
+
+	// 1. apply snapshot
 	if snapshot != nil {
 		rc.raftStorage.ApplySnapshot(*snapshot)
 	}
+	// 2. 设置 state, st 是从 wal 中恢复的
 	rc.raftStorage.SetHardState(st)
 
-	// append to storage so raft starts at the right place in log
+	// 3. append to storage so raft starts at the right place in log
 	rc.raftStorage.Append(ents)
 
 	return w
@@ -280,6 +295,7 @@ func (rc *raftNode) startRaft() {
 	rc.snapshotter = snap.New(zap.NewExample(), rc.snapdir)
 
 	oldwal := wal.Exist(rc.waldir)
+	// 内部会更新 rc.snapshotter
 	rc.wal = rc.replayWAL()
 
 	// signal replay has finished
@@ -340,6 +356,7 @@ func (rc *raftNode) stopHTTP() {
 	<-rc.httpdonec
 }
 
+// publishSnapshot 更新 snapshot 相关的信息，向 commitC 发送 nil 通知 上层加载 snapshot
 func (rc *raftNode) publishSnapshot(snapshotToSave raftpb.Snapshot) {
 	if raft.IsEmptySnap(snapshotToSave) {
 		return
@@ -360,6 +377,7 @@ func (rc *raftNode) publishSnapshot(snapshotToSave raftpb.Snapshot) {
 
 var snapshotCatchUpEntriesN uint64 = 10000
 
+// maybeTriggerSnapshot 何时产生 snapshot? 当 apply 的 log 达到了 snapCount 的时候，就会产生一次 snapshot!
 func (rc *raftNode) maybeTriggerSnapshot(applyDoneC <-chan struct{}) {
 	if rc.appliedIndex-rc.snapshotIndex <= rc.snapCount {
 		return
@@ -374,11 +392,14 @@ func (rc *raftNode) maybeTriggerSnapshot(applyDoneC <-chan struct{}) {
 		}
 	}
 
+	// 产生 snapshot
 	log.Printf("start snapshot [applied index: %d | last snapshot index: %d]", rc.appliedIndex, rc.snapshotIndex)
+	// 此处会调用 kvStore 的 getSnapshot，此处是将 map 进行 json 编码，也就是让上层状态机产生 snapshot
 	data, err := rc.getSnapshot()
 	if err != nil {
 		log.Panic(err)
 	}
+	// RaftStorage 产生 snapshot, 上层产生的 snapshot 数据会被 raft storage 保存
 	snap, err := rc.raftStorage.CreateSnapshot(rc.appliedIndex, &rc.confState, data)
 	if err != nil {
 		panic(err)
@@ -391,6 +412,7 @@ func (rc *raftNode) maybeTriggerSnapshot(applyDoneC <-chan struct{}) {
 	if rc.appliedIndex > snapshotCatchUpEntriesN {
 		compactIndex = rc.appliedIndex - snapshotCatchUpEntriesN
 	}
+	// compact 掉 raftstorage 中 entries
 	if err := rc.raftStorage.Compact(compactIndex); err != nil {
 		panic(err)
 	}
@@ -445,27 +467,34 @@ func (rc *raftNode) serveChannels() {
 	for {
 		select {
 		case <-ticker.C:
+			// 驱动 raft 逻辑时钟
 			rc.node.Tick()
 
 		// store raft entries to wal, then publish over commit channel
 		case rd := <-rc.node.Ready():
 			rc.wal.Save(rd.HardState, rd.Entries)
+			// raft 产生快照了，应用快照
 			if !raft.IsEmptySnap(rd.Snapshot) {
 				rc.saveSnap(rd.Snapshot)
 				rc.raftStorage.ApplySnapshot(rd.Snapshot)
 				rc.publishSnapshot(rd.Snapshot)
 			}
+			// 因为在 raft 内部，只是将 entries 保存在了 raft log 的 unstable 中了，外部需要将其进行 log 的『持久化』（虽然现在使用的是 MemoryStorage）
 			rc.raftStorage.Append(rd.Entries)
+			// 在 StepLeader 中有 r.bcastAppend()， 这个就是代表产生 广播消息，然后放到 Ready 中，由外部来进行实际的处理
+			// 这里就是实际的 bcast msg
 			rc.transport.Send(rd.Messages)
 			applyDoneC, ok := rc.publishEntries(rc.entriesToApply(rd.CommittedEntries))
 			if !ok {
 				rc.stop()
 				return
 			}
+			// 是否产生 snapshot?
 			rc.maybeTriggerSnapshot(applyDoneC)
 			rc.node.Advance()
 
 		case err := <-rc.transport.ErrorC:
+			// 处理网络异常
 			rc.writeError(err)
 			return
 

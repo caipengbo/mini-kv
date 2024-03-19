@@ -39,11 +39,14 @@ type kv struct {
 }
 
 func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <-chan *commit, errorC <-chan error) *kvstore {
+	// raft node 启动后，才能从 snapshot channel 中获得 snapshotter，所以这里可以确保 raft node 先与 kvstorage 启动
 	s := &kvstore{proposeC: proposeC, kvStore: make(map[string]string), snapshotter: snapshotter}
+	// 通过 snapshotter 加载 snapshot
 	snapshot, err := s.loadSnapshot()
 	if err != nil {
 		log.Panic(err)
 	}
+	// 从 snapshot 中恢复 kv store 中的数据
 	if snapshot != nil {
 		log.Printf("loading snapshot at term %d and index %d", snapshot.Metadata.Term, snapshot.Metadata.Index)
 		if err := s.recoverFromSnapshot(snapshot.Data); err != nil {
@@ -64,6 +67,7 @@ func (s *kvstore) Lookup(key string) (string, bool) {
 
 func (s *kvstore) Propose(k string, v string) {
 	var buf bytes.Buffer
+	// 使用 go 标准库中的二进制序列化库，将 kv 序列化成二进制
 	if err := gob.NewEncoder(&buf).Encode(kv{k, v}); err != nil {
 		log.Fatal(err)
 	}
@@ -97,6 +101,7 @@ func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
 			s.kvStore[dataKv.Key] = dataKv.Val
 			s.mu.Unlock()
 		}
+		// 通知
 		close(commit.applyDoneC)
 	}
 	if err, ok := <-errorC; ok {
@@ -104,12 +109,14 @@ func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
 	}
 }
 
+// 会被传递给 raftNode, 让其产生 snapshop
 func (s *kvstore) getSnapshot() ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return json.Marshal(s.kvStore)
 }
 
+// loadSnapshot 加载 snapshot
 func (s *kvstore) loadSnapshot() (*raftpb.Snapshot, error) {
 	snapshot, err := s.snapshotter.Load()
 	if err == snap.ErrNoSnapshot {
@@ -121,6 +128,7 @@ func (s *kvstore) loadSnapshot() (*raftpb.Snapshot, error) {
 	return snapshot, nil
 }
 
+// 从 snapshot 中恢复 kvStore, 可以看到 snapshot 是一个 map 的 json 序列化数据
 func (s *kvstore) recoverFromSnapshot(snapshot []byte) error {
 	var store map[string]string
 	if err := json.Unmarshal(snapshot, &store); err != nil {

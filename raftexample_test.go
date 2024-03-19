@@ -285,3 +285,16 @@ func TestSnapshot(t *testing.T) {
 	close(c.applyDoneC)
 	<-clus.snapshotTriggeredC[0]
 }
+
+func TestClusterPut(t *testing.T) {
+	clus := newCluster(3)
+	defer clus.closeNoErrors(t)
+
+	go func() {
+		clus.proposeC[0] <- "test"
+	}()
+
+	c := <-clus.commitC[0]
+
+	t.Logf("commit: %+v", c)
+}
